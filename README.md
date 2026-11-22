@@ -8,6 +8,8 @@ A production-ready **FastAPI + Docker B2B automation gateway** uniting KiberLabs
 
 Built as a reusable deployment accelerator so B2B teams can go from specification to a hardened, containerized REST service with live OpenAPI/Swagger (`/docs`) in days instead of weeks.
 
+
+> **Public Evaluation Sandbox & Scope Note:** This repository contains the open reference core and deterministic `pytest` harness operating on synthetic fixtures (`data/sample_*`) under the [MIT License](LICENSE). Production connectors (live anti-bot scrapers, WhatsApp/Telegram cloud webhooks, ERP/SAP & VIES adapters, and multi-tenant deployment manifests) are maintained in **KiberLabs Private Enterprise Repositories** and delivered under client SOW.
 ---
 
 ## Architecture
@@ -63,4 +65,4 @@ docker run -p 8000:8000 -e KIBERLABS_API_KEYS=your-secret-key kiberlabs-automati
 
 ## License
 
-MIT — Built by **KiberLabs Engineering** (*AI & Python Automation Studio*).
+[MIT](LICENSE) — Built by **KiberLabs Engineering** (*AI & Python Automation Studio*).
