@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import weakref
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
+
+_SQLITE_IN_BATCH_SIZE = 500
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS api_audit_log (
@@ -47,6 +53,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
 """
 
 
+def _close_tracked_conns(conns: set[sqlite3.Connection], lock: threading.Lock) -> None:
+    """Close all tracked SQLite connections cleanly (used by close() and weakref.finalize)."""
+    with lock:
+        to_close = list(conns)
+        conns.clear()
+    for conn in to_close:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 class GatewayStore:
     """Thread-safe SQLite WAL + FTS5 persistence layer shared by all gateway endpoints."""
 
@@ -54,18 +72,60 @@ class GatewayStore:
         """Initialize SQLite in WAL mode (busy_timeout=5000ms) and bootstrap schema tables."""
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.executescript(SCHEMA_SQL)
+        self._local = threading.local()
+        self._conns_lock = threading.Lock()
+        self._conns: set[sqlite3.Connection] = set()
+        self._closed = False
+        self._finalizer = weakref.finalize(self, _close_tracked_conns, self._conns, self._conns_lock)
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a per-operation SQLite connection configured for concurrent WAL readers/writers."""
-        conn = sqlite3.connect(str(self.db_path), timeout=5.0)
-        conn.row_factory = sqlite3.Row
+        conn = self._open_connection()
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
+        with conn:
+            conn.executescript(SCHEMA_SQL)
+        with self._conns_lock:
+            self._conns.add(conn)
+            self._local.conn = conn
+
+    def _open_connection(self) -> sqlite3.Connection:
+        """Open a SQLite connection configured for concurrent WAL readers/writers."""
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield this thread's persistent WAL connection inside a transaction context."""
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed GatewayStore.")
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            new_conn = self._open_connection()
+            with self._conns_lock:
+                if self._closed:
+                    new_conn.close()
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed GatewayStore.")
+                self._conns.add(new_conn)
+                self._local.conn = new_conn
+            conn = new_conn
+        with conn:
+            yield conn
+
+    def close(self) -> None:
+        """Close all tracked thread-local SQLite connections cleanly."""
+        with self._conns_lock:
+            self._closed = True
+        _close_tracked_conns(self._conns, self._conns_lock)
+        self._local = threading.local()
+        self._finalizer.detach()
+
+    def __enter__(self) -> GatewayStore:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def journal_mode(self) -> str:
         """Return active SQLite journal mode (expected: 'wal')."""
@@ -94,11 +154,12 @@ class GatewayStore:
 
     def recent_audit(self, limit: int = 20) -> list[dict[str, object]]:
         """Return the latest API audit log records ordered newest-first."""
+        bounded = max(1, min(int(limit), 100))
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT request_id, method, path, status_code, latency_ms, created_at "
                 "FROM api_audit_log ORDER BY id DESC LIMIT ?",
-                (limit,),
+                (bounded,),
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -130,6 +191,7 @@ class GatewayStore:
     def upsert_rag_chunks(self, doc_id: str, rows: list[tuple[str, str, str, str, str]]) -> int:
         """Atomically replace all indexed chunks for doc_id across both rag_chunks and FTS5."""
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
             old_ids = [
                 r["chunk_id"]
                 for r in conn.execute(
@@ -137,10 +199,13 @@ class GatewayStore:
                 ).fetchall()
             ]
             if old_ids:
-                placeholders = ",".join("?" for _ in old_ids)
-                conn.execute(
-                    f"DELETE FROM rag_chunks_fts WHERE chunk_id IN ({placeholders})", old_ids
-                )
+                for start in range(0, len(old_ids), _SQLITE_IN_BATCH_SIZE):
+                    batch = old_ids[start : start + _SQLITE_IN_BATCH_SIZE]
+                    placeholders = ",".join("?" for _ in batch)
+                    conn.execute(
+                        f"DELETE FROM rag_chunks_fts WHERE chunk_id IN ({placeholders})",
+                        batch,
+                    )
             conn.execute("DELETE FROM rag_chunks WHERE doc_id = ?", (doc_id,))
 
             for chunk_id, title, section_ref, text, chunk_hash in rows:
@@ -159,6 +224,9 @@ class GatewayStore:
 
     def search_rag_fts(self, fts_expr: str, top_k: int = 3) -> list[dict[str, object]]:
         """Execute a BM25-ranked FTS5 query and return up to top_k grounded chunks."""
+        if not fts_expr or not fts_expr.strip():
+            return []
+        bounded_k = max(1, min(int(top_k), 250))
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -176,6 +244,6 @@ class GatewayStore:
                 ORDER BY raw_bm25 ASC
                 LIMIT ?
                 """,
-                (fts_expr, top_k),
+                (fts_expr, bounded_k),
             ).fetchall()
             return [dict(r) for r in rows]
