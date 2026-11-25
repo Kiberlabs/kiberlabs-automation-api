@@ -19,9 +19,9 @@ _HEADING_RE = re.compile(
     r"^(?:#{1,3}\s+|(?:Article|Art[ií]culo|Section|Secci[oó]n|Clause)\s+[0-9]+(?:\.[0-9]+)*)",
     re.IGNORECASE,
 )
-_AMT = r"(\d{1,3}(?:[.,]\d{3})+|\d{2,6})([.,]\d{1,2})?(?!\d|[.,]\d)"
+_AMT = r"([1-9]\d{0,2}(?:[.,]\d{3})+|\d{1,6})([.,]\d{1,3}(?=[kKmM])|[.,]\d{1,2})?([kKmM])?(?!\d|[.,]\d)"
 _BUDGET_RE = re.compile(
-    rf"(?:[€$]\s*{_AMT}(?![A-Za-z])|(?<![\d.,]){_AMT}\s*(?:€|\$|(?:eur|euros?|usd)\b)(?![A-Za-z]))",
+    rf"(?:(?<![A-Za-zÀ-ÿ\d.,])[€$]\s*{_AMT}(?![A-Za-zÀ-ÿ])|(?<![A-Za-zÀ-ÿ\d.,]){_AMT}\s*(?:(?:€|\$)(?![A-Za-zÀ-ÿ\d])|(?:eur|euros?|usd)\b(?![A-Za-zÀ-ÿ])))",
     re.IGNORECASE,
 )
 
@@ -40,17 +40,22 @@ def _reject_bool(value: object) -> object:
 
 
 def _extract_budget_eur(text: str) -> float | None:
-    """Parse first European/US currency expression within 50–250,000 EUR."""
-    match = _BUDGET_RE.search(text)
-    if not match:
-        return None
-    int_part = match.group(1) or match.group(3) or ""
-    dec_part = match.group(2) or match.group(4) or ""
-    raw = int_part.replace(".", "").replace(",", "")
-    if dec_part:
-        raw = f"{raw}.{dec_part[1:]}"
-    value = float(raw)
-    return value if 50.0 <= value <= 250_000.0 else None
+    """Parse first European/US currency expression (with optional k/M) within 50–250,000 EUR."""
+    for match in _BUDGET_RE.finditer(text):
+        int_part = match.group(1) or match.group(4) or ""
+        dec_part = match.group(2) or match.group(5) or ""
+        suffix = (match.group(3) or match.group(6) or "").lower()
+        raw = int_part.replace(".", "").replace(",", "")
+        if dec_part:
+            raw = f"{raw}.{dec_part[1:]}"
+        value = float(raw)
+        if suffix == "k":
+            value *= 1_000.0
+        elif suffix == "m":
+            value *= 1_000_000.0
+        if 50.0 <= value <= 250_000.0:
+            return value
+    return None
 
 
 def _compile_word_matcher(phrases: tuple[str, ...]) -> re.Pattern[str]:
@@ -102,8 +107,6 @@ _COMPLAINT_OPTOUT_PATTERNS = (
     "delete my data",
     "erase my data",
     "remove my data",
-    "gdpr",
-    "rgpd",
     "no me escribas",
     "no me contactes",
     "deja de escribir",
@@ -115,6 +118,9 @@ _COMPLAINT_OPTOUT_PATTERNS = (
     "borrar mis datos",
     "elimina mis datos",
     "eliminar mis datos",
+    "suprimir mis datos",
+    "supresion de mis datos",
+    "supresion de datos",
     "derecho al olvido",
     "denunciar",
 )
@@ -152,6 +158,17 @@ _SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 _SPAM_RE = _compile_word_matcher(_SPAM_PHRASES)
 _OPTOUT_RE = _compile_word_matcher(_COMPLAINT_OPTOUT_PATTERNS)
+_GDPR_OPTOUT_ACTION = (
+    r"(?:(?:delete|erase|remove|borra\w*|elimina\w*|suprim\w*)\s+"
+    r"(?:all\s+|todos\s+)?(?:my|our|mis|nuestros)\b"
+    r"|baja|opt[- ]?out|erasure|complaint|reclamacion|denuncia\w*"
+    r"|report\s+(?:you|this|it|to)\b|aepd|ico)"
+)
+_GDPR_OPTOUT_RE = re.compile(
+    rf"\b(?:(?:gdpr|rgpd)\b.{{0,30}}\b{_GDPR_OPTOUT_ACTION}"
+    rf"|{_GDPR_OPTOUT_ACTION}.{{0,30}}\b(?:gdpr|rgpd)\b"
+    rf"|(?:gdpr|rgpd)\s+(?:removal|deletion)\b)"
+)
 _SERVICE_MATCHERS = tuple((cat, _compile_word_matcher(kws)) for cat, kws in _SERVICE_KEYWORDS.items())
 
 _STOPWORDS = frozenset(
@@ -369,7 +386,7 @@ def handle_lead_webhook(req: LeadWebhookRequest, store: GatewayStore) -> dict[st
     """Process a 24/7 lead webhook with atomic SQLite WAL deduplication and zero-token triage."""
     norm = _normalize_lead_text(req.text)
     is_spam = norm.count("http://") + norm.count("https://") >= 3 or _SPAM_RE.search(norm) is not None
-    is_optout = _OPTOUT_RE.search(norm) is not None
+    is_optout = _OPTOUT_RE.search(norm) is not None or _GDPR_OPTOUT_RE.search(norm) is not None
 
     budget_eur: float | None = None
     if is_spam:

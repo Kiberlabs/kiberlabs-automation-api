@@ -7,7 +7,10 @@ import importlib
 import json
 import random
 import sqlite3
+import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +19,13 @@ import kiberlabs_api.app as app_module
 from kiberlabs_api.app import create_app
 from kiberlabs_api.config import GatewaySettings
 from kiberlabs_api.security import SlidingWindowRateLimiter, validate_public_http_url
-from kiberlabs_api.services import SieveBatchRequest, classify_lead_service, evaluate_sieve_batch
+from kiberlabs_api.services import (
+    SieveBatchRequest,
+    _extract_budget_eur,
+    classify_lead_service,
+    evaluate_sieve_batch,
+)
+from kiberlabs_api.storage import GatewayStore
 
 
 def _build_client(tmp_path: Path, rpm: int = 50) -> TestClient:
@@ -793,15 +802,15 @@ def test_fuzz_lead_budget_optout_spam_and_panel_solar_parity(tmp_path: Path) -> 
     assert classify_lead_service("Necesito automatizar un panel de control con FastAPI") == "b2b_automation"
 
     fixed_cases = [
-        ("Presupuesto de $3k para empezar", "NEEDS_BUDGET", None),
+        ("Presupuesto de $3k para empezar", "HANDOFF_READY", 3000.0),
         ("Tenemos $500k de fondos", "NEEDS_BUDGET", None),
         ("Con €500k de inversion", "NEEDS_BUDGET", None),
         ("Budget is $500M total", "NEEDS_BUDGET", None),
         ("Presupuesto 500k EUR", "NEEDS_BUDGET", None),
         ("Pago €120.3456 exactos", "NEEDS_BUDGET", None),
         ("Importe 100.5000 EUR", "NEEDS_BUDGET", None),
-        ("Entre $10 y $1,500 disponibles", "NEEDS_BUDGET", None),
-        ("Presupuesto $10 o $1,500", "NEEDS_BUDGET", None),
+        ("Entre $10 y $1,500 disponibles", "HANDOFF_READY", 1500.0),
+        ("Presupuesto $10 o $1,500", "HANDOFF_READY", 1500.0),
         ("No me escribas mas, darme de baja RGPD — presupuesto 1.200€", "COMPLAINT_OPTOUT", None),
         ("Stop messaging GDPR budget $1,500", "COMPLAINT_OPTOUT", None),
         ("Please opt out and delete my data 900 EUR", "COMPLAINT_OPTOUT", None),
@@ -829,11 +838,11 @@ def test_fuzz_lead_budget_optout_spam_and_panel_solar_parity(tmp_path: Path) -> 
                 text = rng.choice([f"Presupuesto de {amt}€", f"Budget ${amt}", f"Tenemos {amt} EUR"])
                 exp_status, exp_budget = "HANDOFF_READY", float(amt)
             elif mode == 1:
-                bad_amt = rng.choice(["$3k", "$500k", "€500k", "€120.3456", "100.5000 EUR", "$10 ... $1,500"])
+                bad_amt = rng.choice(["$500k", "€500k", "$2M", "4k video", "3kg EUR", "€120.3456", "100.5000 EUR", "$1000000"])
                 text = f"Consulta comercial sobre {bad_amt}"
                 exp_status, exp_budget = "NEEDS_BUDGET", None
             else:
-                opt = rng.choice(["GDPR", "RGPD", "darme de baja", "unsubscribe", "do not contact"])
+                opt = rng.choice(["GDPR delete my data", "baja RGPD", "suprimir mis datos", "darme de baja", "unsubscribe", "do not contact"])
                 text = f"Por favor {opt}, presupuesto {rng.randint(100, 5000)}€"
                 exp_status, exp_budget = "COMPLAINT_OPTOUT", None
 
@@ -957,3 +966,280 @@ def test_auth_ban_non_bypass_audit_resilience_and_concurrent_burst(
     for conn in opened_conns:
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_budget"),
+    [
+        ("$3k", 3000.0),
+        ("€1.5k", 1500.0),
+        ("2,5k€", 2500.0),
+        ("10k EUR", 10000.0),
+        ("$0.2M", 200000.0),
+        ("0.15M EUR", 150000.0),
+        ("$0.05k", 50.0),
+        ("$0.050k", 50.0),
+        ("€0.125k", 125.0),
+        ("$0.001M", 1000.0),
+        ("$0.049k", None),
+        ("€0,049k", None),
+        ("$0.0495k", None),
+        ("€120.3456", None),
+        ("1.200,50€", 1200.5),
+        ("$250k", 250000.0),
+        ("RGPD audit & ISO27001 $1.5k", 1500.0),
+        ("HTTP 200 $1.5k", 1500.0),
+        ("order #1234 $500", 500.0),
+        ("v2 $3k", 3000.0),
+        ("1500€ 2 semanas", 1500.0),
+        ("500 europe", None),
+        ("$10 setup, total $1,500", 1500.0),
+        ("€5/mes o $3k anual", 3000.0),
+        ("$500k o $2k", 2000.0),
+        ("$49.99 y luego $50", 50.0),
+        ("Desde 25€ hasta 1.200€", 1200.0),
+        ("4k video", None),
+        ("100k followers", None),
+        ("3kg EUR", None),
+        ("€3kg", None),
+        ("$500k", None),
+        ("$1M", None),
+        ("$250.01k", None),
+        ("$3k5", None),
+    ],
+)
+def test_extract_budget_eur_km_scaling_and_multi_amount_alignment(
+    tmp_path: Path, text: str, expected_budget: float | None
+) -> None:
+    assert _extract_budget_eur(text) == expected_budget
+    with _build_client(tmp_path) as client:
+        resp = client.post(
+            "/v1/leads/webhook",
+            headers={"X-API-Key": "kl-test-secret-key"},
+            json={
+                "channel": "web",
+                "message_id": f"km-{abs(hash(text))}",
+                "sender_id": "lead-km",
+                "text": f"Proyecto: {text}",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        expected_status = "HANDOFF_READY" if expected_budget is not None else "NEEDS_BUDGET"
+        assert body["status"] == expected_status
+        assert body["estimated_budget_eur"] == expected_budget
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_status", "expected_budget"),
+    [
+        ("Are you GDPR compliant?", "NEEDS_BUDGET", None),
+        ("¿Vuestro bot cumple con RGPD?", "NEEDS_BUDGET", None),
+        ("We need a GDPR RAG API budget $1500", "HANDOFF_READY", 1500.0),
+        ("Necesitamos bot RGPD presupuesto 900 EUR", "HANDOFF_READY", 900.0),
+        ("Necesito API workflow con DPA GDPR presupuesto 2.000€", "HANDOFF_READY", 2000.0),
+        ("suprimir mis datos", "COMPLAINT_OPTOUT", None),
+        ("Quiero supresión de mis datos bajo RGPD", "COMPLAINT_OPTOUT", None),
+        ("Solicito supresión de datos", "COMPLAINT_OPTOUT", None),
+        ("GDPR delete my data", "COMPLAINT_OPTOUT", None),
+        ("GDPR removal", "COMPLAINT_OPTOUT", None),
+        ("GDPR deletion", "COMPLAINT_OPTOUT", None),
+        ("Quiero darme de baja por RGPD", "COMPLAINT_OPTOUT", None),
+        ("Solicito baja RGPD", "COMPLAINT_OPTOUT", None),
+        ("Quiero borrar todos mis datos bajo RGPD presupuesto 1.000€", "COMPLAINT_OPTOUT", None),
+        ("Suprima nuestros datos RGPD", "COMPLAINT_OPTOUT", None),
+        ("GDPR opt-out", "COMPLAINT_OPTOUT", None),
+        ("RGPD erasure", "COMPLAINT_OPTOUT", None),
+        ("reclamación RGPD", "COMPLAINT_OPTOUT", None),
+        ("denuncia AEPD RGPD", "COMPLAINT_OPTOUT", None),
+        ("report you to ICO GDPR", "COMPLAINT_OPTOUT", None),
+    ],
+)
+def test_lead_webhook_gdpr_rgpd_context_alignment(
+    tmp_path: Path, text: str, expected_status: str, expected_budget: float | None
+) -> None:
+    with _build_client(tmp_path) as client:
+        resp = client.post(
+            "/v1/leads/webhook",
+            headers={"X-API-Key": "kl-test-secret-key"},
+            json={
+                "channel": "whatsapp",
+                "message_id": f"gdpr-{abs(hash(text))}",
+                "sender_id": "lead-gdpr",
+                "text": text,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == expected_status
+        assert body["estimated_budget_eur"] == expected_budget
+
+
+class _GatewaySpyConn:
+    def __init__(self, inner: sqlite3.Connection, sql_log: list[str], fail_hook: Any = None) -> None:
+        self._inner = inner
+        self._sql_log = sql_log
+        self._fail_hook = fail_hook
+        self.closed = False
+
+    @property
+    def row_factory(self) -> Any:
+        return self._inner.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value: Any) -> None:
+        self._inner.row_factory = value
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        normalized = " ".join(sql.split()).rstrip(";").upper()
+        self._sql_log.append(normalized)
+        if self._fail_hook is not None:
+            self._fail_hook("execute", normalized)
+        return self._inner.execute(sql, *args, **kwargs)
+
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
+        self._sql_log.append("EXECUTESCRIPT")
+        if self._fail_hook is not None:
+            self._fail_hook("executescript", sql_script)
+        return self._inner.executescript(sql_script)
+
+    def commit(self) -> None:
+        self._inner.commit()
+
+    def close(self) -> None:
+        self.closed = True
+        self._inner.close()
+
+    def __enter__(self) -> _GatewaySpyConn:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> bool | None:
+        return self._inner.__exit__(*exc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def test_gateway_store_pragma_order_and_skips_redundant_wal(monkeypatch: pytest.MonkeyPatch) -> None:
+    sql_log: list[str] = []
+    timeouts: list[object] = []
+    real_connect = sqlite3.connect
+
+    def spy_connect(*args: object, **kwargs: object) -> _GatewaySpyConn:
+        timeouts.append(kwargs.get("timeout"))
+        return _GatewaySpyConn(real_connect(*args, **kwargs), sql_log)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", spy_connect)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "gateway_pragma.db"
+        with GatewayStore(db_path) as store:
+            assert timeouts == [5.0]
+            busy_idx = sql_log.index("PRAGMA BUSY_TIMEOUT=5000")
+            mode_idx = sql_log.index("PRAGMA JOURNAL_MODE")
+            wal_idx = sql_log.index("PRAGMA JOURNAL_MODE=WAL")
+            assert busy_idx < mode_idx < wal_idx
+
+        sql_log.clear()
+        with GatewayStore(db_path) as store:
+            assert "PRAGMA BUSY_TIMEOUT=5000" in sql_log
+            assert "PRAGMA JOURNAL_MODE" in sql_log
+            assert "PRAGMA JOURNAL_MODE=WAL" not in sql_log
+
+            sql_log.clear()
+            err_holder: list[BaseException] = []
+
+            def worker() -> None:
+                try:
+                    assert store.record_webhook_once("web", "w-1", "s-1", "NEEDS_BUDGET") is True
+                except BaseException as exc:  # pragma: no cover
+                    err_holder.append(exc)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(worker).result()
+            assert err_holder == []
+            assert "PRAGMA BUSY_TIMEOUT=5000" in sql_log
+            assert "PRAGMA JOURNAL_MODE=WAL" not in sql_log
+
+    with GatewayStore(":memory:") as mem_store:
+        assert mem_store.journal_mode() == "memory"
+
+
+def test_gateway_store_cold_start_retry_and_tempdir_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(time, "sleep", lambda _secs: None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "retry.db"
+        conns: list[_GatewaySpyConn] = []
+        sql_log: list[str] = []
+
+        def flaky_wal_connect(*args: object, **kwargs: object) -> _GatewaySpyConn:
+            attempt = len(conns) + 1
+
+            def fail_hook(kind: str, sql: str) -> None:
+                if kind == "execute" and sql == "PRAGMA JOURNAL_MODE=WAL" and attempt <= 2:
+                    raise sqlite3.OperationalError("database is locked")
+
+            spy = _GatewaySpyConn(real_connect(*args, **kwargs), sql_log, fail_hook)  # type: ignore[arg-type]
+            conns.append(spy)
+            return spy
+
+        monkeypatch.setattr(sqlite3, "connect", flaky_wal_connect)
+        store = GatewayStore(db_path)
+        assert len(conns) == 3
+        assert conns[0].closed and conns[1].closed
+        assert not conns[2].closed
+        assert store.record_webhook_once("whatsapp", "m-retry", "s-retry", "HANDOFF_READY") is True
+        store.close()
+        assert conns[2].closed
+
+    assert not tmp_dir.exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "always_locked_schema.db"
+        conns = []
+        sql_log = []
+
+        def schema_locked_connect(*args: object, **kwargs: object) -> _GatewaySpyConn:
+            def fail_hook(kind: str, _sql: str) -> None:
+                if kind == "executescript":
+                    raise sqlite3.OperationalError("database is locked")
+
+            spy = _GatewaySpyConn(real_connect(*args, **kwargs), sql_log, fail_hook)  # type: ignore[arg-type]
+            conns.append(spy)
+            return spy
+
+        monkeypatch.setattr(sqlite3, "connect", schema_locked_connect)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            GatewayStore(db_path)
+        assert len(conns) == 6
+        assert all(c.closed for c in conns)
+
+    assert not tmp_dir.exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "non_lock.db"
+        conns = []
+        sql_log = []
+
+        def non_lock_connect(*args: object, **kwargs: object) -> _GatewaySpyConn:
+            def fail_hook(kind: str, sql: str) -> None:
+                if kind == "execute" and sql == "PRAGMA JOURNAL_MODE=WAL":
+                    raise sqlite3.OperationalError("disk I/O error")
+
+            spy = _GatewaySpyConn(real_connect(*args, **kwargs), sql_log, fail_hook)  # type: ignore[arg-type]
+            conns.append(spy)
+            return spy
+
+        monkeypatch.setattr(sqlite3, "connect", non_lock_connect)
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+            GatewayStore(db_path)
+        assert len(conns) == 1
+        assert conns[0].closed
+
+    assert not tmp_dir.exists()

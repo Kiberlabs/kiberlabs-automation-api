@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import random
 import sqlite3
 import threading
+import time
 import weakref
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -11,6 +13,12 @@ from pathlib import Path
 from typing import Iterator
 
 _SQLITE_IN_BATCH_SIZE = 500
+_SQLITE_OPEN_MAX_ATTEMPTS = 6
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS api_audit_log (
@@ -71,29 +79,55 @@ class GatewayStore:
     def __init__(self, db_path: str | Path) -> None:
         """Initialize SQLite in WAL mode (busy_timeout=5000ms) and bootstrap schema tables."""
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if str(self.db_path) != ":memory:":
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._conns_lock = threading.Lock()
         self._conns: set[sqlite3.Connection] = set()
         self._closed = False
         self._finalizer = weakref.finalize(self, _close_tracked_conns, self._conns, self._conns_lock)
 
-        conn = self._open_connection()
-        conn.execute("PRAGMA journal_mode=WAL;")
-        with conn:
-            conn.executescript(SCHEMA_SQL)
+        conn = self._open_connection(init_schema=True)
         with self._conns_lock:
             self._conns.add(conn)
             self._local.conn = conn
 
-    def _open_connection(self) -> sqlite3.Connection:
+    def _open_connection(self, init_schema: bool = False) -> sqlite3.Connection:
         """Open a SQLite connection configured for concurrent WAL readers/writers."""
-        conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        for attempt in range(_SQLITE_OPEN_MAX_ATTEMPTS):
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=5000;")
+                mode_row = conn.execute("PRAGMA journal_mode;").fetchone()
+                mode = str(mode_row[0]).lower() if mode_row else ""
+                if mode not in ("wal", "memory"):
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.execute("PRAGMA foreign_keys=ON;")
+                if init_schema:
+                    with conn:
+                        conn.executescript(SCHEMA_SQL)
+                return conn
+            except sqlite3.OperationalError as exc:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                if _is_transient_sqlite_error(exc) and attempt < _SQLITE_OPEN_MAX_ATTEMPTS - 1:
+                    time.sleep(min(0.2, 0.02 * (2 ** attempt)) + random.uniform(0.0, 0.02))
+                    continue
+                raise
+            except BaseException:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                raise
+        raise sqlite3.OperationalError("database is locked")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
