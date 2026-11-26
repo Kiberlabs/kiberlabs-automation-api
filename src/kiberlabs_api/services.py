@@ -14,6 +14,7 @@ from kiberlabs_api.security import validate_public_http_url
 from kiberlabs_api.storage import GatewayStore
 
 _MAX_SAFE_AMOUNT = 1e12
+_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad]")
 
 _HEADING_RE = re.compile(
     r"^(?:#{1,3}\s+|(?:Article|Art[ií]culo|Section|Secci[oó]n|Clause)\s+[0-9]+(?:\.[0-9]+)*)",
@@ -27,7 +28,9 @@ _BUDGET_RE = re.compile(
 
 
 def _clean_non_empty(value: str, min_len: int, field_name: str) -> str:
-    cleaned = value.replace("\x00", "").strip()
+    cleaned = "".join(
+        ch for ch in _ZERO_WIDTH_RE.sub("", value.replace("\x00", "")) if unicodedata.category(ch) != "Cf"
+    ).strip()
     if len(cleaned) < min_len:
         raise ValueError(f"{field_name} must contain at least {min_len} non-whitespace characters")
     return cleaned
@@ -41,7 +44,8 @@ def _reject_bool(value: object) -> object:
 
 def _extract_budget_eur(text: str) -> float | None:
     """Parse first European/US currency expression (with optional k/M) within 50–250,000 EUR."""
-    for match in _BUDGET_RE.finditer(text):
+    norm_text = unicodedata.normalize("NFKC", _ZERO_WIDTH_RE.sub("", text))
+    for match in _BUDGET_RE.finditer(norm_text):
         int_part = match.group(1) or match.group(4) or ""
         dec_part = match.group(2) or match.group(5) or ""
         suffix = (match.group(3) or match.group(6) or "").lower()
@@ -418,7 +422,8 @@ def handle_lead_webhook(req: LeadWebhookRequest, store: GatewayStore) -> dict[st
 
 def _fold_ascii(text: str) -> str:
     """Fold Unicode diacritics into lowercase ASCII for accent-insensitive EN/ES matching."""
-    nfkd = unicodedata.normalize("NFKD", text)
+    cleaned = _ZERO_WIDTH_RE.sub("", text)
+    nfkd = unicodedata.normalize("NFKD", cleaned)
     return "".join(ch for ch in nfkd if not unicodedata.combining(ch)).lower()
 
 

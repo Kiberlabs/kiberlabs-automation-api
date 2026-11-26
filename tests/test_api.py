@@ -8,18 +8,21 @@ import json
 import random
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 import kiberlabs_api.app as app_module
 from kiberlabs_api.app import create_app
 from kiberlabs_api.config import GatewaySettings
 from kiberlabs_api.security import SlidingWindowRateLimiter, validate_public_http_url
 from kiberlabs_api.services import (
+    LeadWebhookRequest,
     SieveBatchRequest,
     _extract_budget_eur,
     classify_lead_service,
@@ -1243,3 +1246,125 @@ def test_gateway_store_cold_start_retry_and_tempdir_cleanup(monkeypatch: pytest.
         assert conns[0].closed
 
     assert not tmp_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://[64:ff9b::127.0.0.1]/",
+        "http://[64:ff9b::169.254.169.254]/",
+        "http://[::1]/",
+        "http://[::]/",
+        "http://[fd00::1]/",
+        "http://[fe80::1%25eth0]/",
+        "http://017700000001/",
+        "http://2852039166/",
+        "http://0xa9fea9fe/",
+        "http://0/",
+        "http://１２７.０.０.１/",
+        "https://аpple.com/",
+        "http://loc\u200balhost/",
+    ],
+)
+def test_ssrf_ipv6_nat64_octal_decimal_and_unicode_homoglyphs(bad_url: str) -> None:
+    with pytest.raises(ValueError):
+        validate_public_http_url(bad_url)
+    assert validate_public_http_url("https://[2606:4700:4700::1111]/ok") == "https://[2606:4700:4700::1111]/ok"
+
+
+def test_unicode_zero_width_nfd_nfkc_and_homoglyph_resilience(tmp_path: Path) -> None:
+    with _build_client(tmp_path, rpm=100) as client:
+        headers = {"X-API-Key": "kl-test-secret-key"}
+        ing = client.post(
+            "/v1/rag/documents",
+            headers=headers,
+            json={
+                "doc_id": "UNI-01",
+                "title": "RGPD & Breach Policy",
+                "content": "Article 1: Breach\nProcessors must report confirmed breach within 72 hours.",
+            },
+        )
+        assert ing.status_code == 200
+
+        for idx, (text, exp_status, exp_budget) in enumerate(
+            [
+                ("GDPR de\u200blete my data 1500 EUR", "COMPLAINT_OPTOUT", None),
+                ("Solicito supresio\u0301n de datos", "COMPLAINT_OPTOUT", None),
+                ("ｇｄｐｒ removal", "COMPLAINT_OPTOUT", None),
+                ("Presupuesto １.５００ EUR", "HANDOFF_READY", 1500.0),
+                ("Presupuesto 1\u200b500€", "HANDOFF_READY", 1500.0),
+            ]
+        ):
+            r = client.post(
+                "/v1/leads/webhook",
+                headers=headers,
+                json={"channel": "web", "message_id": f"uni-{idx}", "sender_id": "u1", "text": text},
+            )
+            assert r.status_code == 200
+            assert r.json()["status"] == exp_status
+            assert r.json()["estimated_budget_eur"] == exp_budget
+
+        # Cyrillic 'е' homoglyph in 'brеach' must not crash FTS5 and must abstain when unmatched.
+        homoglyph_q = client.post(
+            "/v1/rag/query",
+            headers=headers,
+            json={"query": "br\u0435ach"},
+        )
+        assert homoglyph_q.status_code == 200
+        assert homoglyph_q.json()["status"] == "INSUFFICIENT_EVIDENCE"
+
+        zw_q = client.post(
+            "/v1/rag/query",
+            headers=headers,
+            json={"query": "bre\u200bach 72 hours"},
+        )
+        assert zw_q.status_code == 200
+        assert zw_q.json()["status"] == "GROUNDED"
+
+
+def test_gateway_store_16_thread_wal_stress_and_win_cleanup() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "wal_16t.db"
+        with GatewayStore(db_path) as store:
+            assert store.journal_mode() == "wal"
+            barrier = threading.Barrier(16)
+
+            def worker(tid: int) -> tuple[bool, bool]:
+                barrier.wait(timeout=10.0)
+                unique_ok = store.record_webhook_once("telegram", f"u-{tid}", f"s-{tid}", "HANDOFF_READY")
+                shared_ok = store.record_webhook_once("telegram", "shared-16t", f"s-{tid}", "NEEDS_BUDGET")
+                store.upsert_rag_chunks(
+                    f"DOC-{tid % 4}",
+                    [(f"DOC-{tid % 4}::c001", "Title", "Sec 1", f"Worker {tid} compliance breach 72 hours", f"{tid:016x}")],
+                )
+                hits = store.search_rag_fts('"compliance"', top_k=3)
+                store.log_request(f"req-{tid}", "POST", "/v1/stress", 200, 1.5)
+                _ = store.recent_audit(limit=5)
+                assert len(hits) >= 1
+                return unique_ok, shared_ok
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                outcomes = list(pool.map(worker, range(16)))
+
+            assert sum(1 for u, _ in outcomes if u) == 16
+            assert sum(1 for _, s in outcomes if s) == 1
+
+    assert not tmp_dir.exists()
+
+
+def test_lead_webhook_rejects_zero_width_and_format_only_fields() -> None:
+    with pytest.raises(ValidationError):
+        LeadWebhookRequest(
+            channel="whatsapp",
+            message_id="\u200b\u200b",
+            sender_id="\u200b\u200b",
+            text="\u200b",
+        )
+    for bad in ("\u00ad\u00ad", "\u200e\u200f", "\u202a\u202e", "\ufeff\u2060"):
+        with pytest.raises(ValidationError):
+            LeadWebhookRequest(channel="whatsapp", message_id=bad, sender_id="ok-sender", text="hello")
+        with pytest.raises(ValidationError):
+            LeadWebhookRequest(channel="whatsapp", message_id="ok-msg", sender_id=bad, text="hello")
+        with pytest.raises(ValidationError):
+            LeadWebhookRequest(channel="whatsapp", message_id="ok-msg", sender_id="ok-sender", text=bad)

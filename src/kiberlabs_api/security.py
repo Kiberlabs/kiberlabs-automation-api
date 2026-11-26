@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 _METADATA_NET = ipaddress.ip_network("169.254.0.0/16")
+_NAT64_NET = ipaddress.ip_network("64:ff9b::/96")
 _INTERNAL_HOSTS = frozenset(
     {
         "localhost",
@@ -66,6 +67,8 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         if ip.sixtofour is not None and _is_blocked_ip(ip.sixtofour):
             return True
         if ip.teredo is not None and any(_is_blocked_ip(addr) for addr in ip.teredo):
+            return True
+        if ip in _NAT64_NET and _is_blocked_ip(ipaddress.IPv4Address(ip.packed[-4:])):
             return True
         if ip.is_site_local:
             return True
